@@ -6,7 +6,8 @@ API_ID = int(os.environ['TG_API_ID'])
 API_HASH = os.environ['TG_API_HASH']
 TG_SESSION = os.environ['TG_SESSION']
 BOT_TOKEN = os.environ['BOT_TOKEN']
-MY_TG_CHANNEL = os.environ['MY_TG_CHANNEL']
+
+MY_TG_CHANNEL = "@StyleGrabDeals"
 MY_AFFILIATE_TAG = os.environ['MY_AFFILIATE_TAG']
 AMAZON_DOMAIN = "www.amazon.in"
 
@@ -26,75 +27,60 @@ def save_posted_asin(asin):
     with open(HISTORY_FILE, "a") as f:
         f.write(f"{asin}\n")
 
-def extract_and_convert(text, posted_asins):
+def extract_asin_only(text):
     urls = re.findall(r'(https?://\S+)', text)
-    found_new_asin = None
     headers = {"User-Agent": "Mozilla/5.0"}
-
     for url in urls:
         clean_url = url.rstrip(').,!*')
         try:
-            res = requests.get(clean_url, allow_redirects=True, timeout=10, headers=headers)
-            final_url = res.url
-            asin_match = re.search(r'/(?:dp|gp/product|gp/aw/d)/([A-Z0-9]{10})', final_url)
+            res = requests.get(clean_url, allow_redirects=True, timeout=8, headers=headers)
+            asin_match = re.search(r'/(?:dp|gp/product|gp/aw/d)/([A-Z0-9]{10})', res.url)
             if asin_match:
-                asin = asin_match.group(1)
-                if asin in posted_asins:
-                    return None, None
-                my_link = f"https://{AMAZON_DOMAIN}/dp/{asin}/?tag={MY_AFFILIATE_TAG}"
-                text = text.replace(clean_url, my_link)
-                found_new_asin = asin
+                return asin_match.group(1)
         except Exception:
             continue
-
-    clean_text = re.sub(r'@\w+', '', text).strip()
-    return clean_text, found_new_asin
+    return None
 
 def main():
     posted_asins = load_posted_asins()
-    posts_sent = 0
+    collected_links = []
 
     with TelegramClient(StringSession(TG_SESSION), API_ID, API_HASH) as client:
         for channel in SOURCE_CHANNELS:
-            if posts_sent >= 3:
+            if len(collected_links) >= 20:
                 break
             try:
-                for message in client.iter_messages(channel, limit=6):
+                for message in client.iter_messages(channel, limit=30):
                     if not message.text:
                         continue
-                    new_caption, asin = extract_and_convert(message.text, posted_asins)
-                    if not asin:
-                        continue
-
-                    if message.photo:
-                        photo_path = message.download_media()
-                        with open(photo_path, 'rb') as img:
-                            requests.post(
-                                f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                                data={"chat_id": MY_TG_CHANNEL, "caption": new_caption[:1024]},
-                                files={"photo": img}
-                            )
-                        os.remove(photo_path)
-                    else:
-                        requests.post(
-                            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                            data={"chat_id": MY_TG_CHANNEL, "text": new_caption}
-                        )
-
-                    if WHAPI_TOKEN and WA_CHANNEL_ID:
-                        requests.post(
-                            "https://gate.whapi.cloud/messages/text",
-                            json={"to": WA_CHANNEL_ID, "body": new_caption},
-                            headers={"Authorization": f"Bearer {WHAPI_TOKEN}"}
-                        )
-
-                    save_posted_asin(asin)
-                    posted_asins.add(asin)
-                    posts_sent += 1
-                    if posts_sent >= 3:
-                        break
+                    asin = extract_asin_only(message.text)
+                    if asin and asin not in posted_asins:
+                        short_link = f"https://{AMAZON_DOMAIN}/dp/{asin}/?tag={MY_AFFILIATE_TAG}"
+                        collected_links.append(short_link)
+                        save_posted_asin(asin)
+                        posted_asins.add(asin)
+                        if len(collected_links) >= 20:
+                            break
             except Exception as e:
                 print(f"Skipped {channel}: {e}")
+
+    if collected_links:
+        # Format message with 20 shortened links only
+        message_body = "🔥 **Latest Loot Deals** 🔥\n\n" + "\n".join(collected_links)
+
+        # 1. Post to Telegram Channel
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data={"chat_id": MY_TG_CHANNEL, "text": message_body}
+        )
+
+        # 2. Post to WhatsApp Channel (if configured)
+        if WHAPI_TOKEN and WA_CHANNEL_ID:
+            requests.post(
+                "https://gate.whapi.cloud/messages/text",
+                json={"to": WA_CHANNEL_ID, "body": message_body},
+                headers={"Authorization": f"Bearer {WHAPI_TOKEN}"}
+            )
 
 if __name__ == "__main__":
     main()
