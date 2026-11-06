@@ -11,9 +11,6 @@ MY_TG_CHANNEL = "@StyleGrabDeals"
 MY_AFFILIATE_TAG = os.environ['MY_AFFILIATE_TAG']
 AMAZON_DOMAIN = "www.amazon.in"
 
-WHAPI_TOKEN = os.environ.get('WHAPI_TOKEN', '')
-WA_CHANNEL_ID = os.environ.get('WA_CHANNEL_ID', '')
-
 SOURCE_CHANNELS = ["lootdeals_official", "indiadesire_deals", "desidime"]
 HISTORY_FILE = "posted_asins.txt"
 
@@ -65,22 +62,11 @@ def main():
                 print(f"Skipped {channel}: {e}")
 
     if collected_links:
-        # Format message with 20 shortened links only
         message_body = "🔥 **Latest Loot Deals** 🔥\n\n" + "\n".join(collected_links)
-
-        # 1. Post to Telegram Channel
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             data={"chat_id": MY_TG_CHANNEL, "text": message_body}
         )
-
-        # 2. Post to WhatsApp Channel (if configured)
-        if WHAPI_TOKEN and WA_CHANNEL_ID:
-            requests.post(
-                "https://gate.whapi.cloud/messages/text",
-                json={"to": WA_CHANNEL_ID, "body": message_body},
-                headers={"Authorization": f"Bearer {WHAPI_TOKEN}"}
-            )
 
 if __name__ == "__main__":
     main()
