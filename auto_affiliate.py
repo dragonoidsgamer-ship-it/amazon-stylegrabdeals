@@ -1,4 +1,4 @@
-import os, re, time, requests
+import os, re, time, html, requests
 from bs4 import BeautifulSoup
 from telethon.sync import TelegramClient
 from telethon.sessions import StringSession
@@ -15,15 +15,32 @@ if not MY_TG_CHANNEL.startswith('@') and not MY_TG_CHANNEL.startswith('-100'):
 MY_AFFILIATE_TAG = os.environ['MY_AFFILIATE_TAG'].strip()
 AMAZON_DOMAIN = "www.amazon.in"
 
-SOURCE_CHANNELS = ["lootdeals_official", "indiadesire_deals", "desidime"]
+# High-volume source channels to supply 100+ unique deals without repeats
+SOURCE_CHANNELS = [
+    "lootdeals_official",
+    "indiadesire_deals",
+    "desidime",
+    "indsfdeals",
+    "trickxpert",
+    "loot_deals_24x7",
+    "bestdealsindia",
+    "amazon_loot_deals",
+    "crazydeals",
+    "online_loot_deals"
+]
+
 HISTORY_FILE = "posted_asins.txt"
-MAX_POSTS_PER_RUN = 20
-COOLDOWN_SECONDS = 48 * 3600  # 2 days (48 hours) strict cooldown
+MAX_POSTS_PER_RUN = 100
+COOLDOWN_SECONDS = 90 * 24 * 3600  # 90 days (3 months) strict no-repeat cooldown
+MAX_RUNTIME_SECONDS = 510          # 8.5 minutes safety cutoff to commit memory cleanly
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept-Language": "en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7"
 }
+
+HTTP_SESSION = requests.Session()
+HTTP_SESSION.headers.update(HEADERS)
 
 def load_recent_asins():
     now = int(time.time())
@@ -38,15 +55,16 @@ def load_recent_asins():
                 continue
             if "|" in line:
                 parts = line.split("|", 1)
-                asin = parts[0].strip()
+                asin = parts[0].strip().upper()
                 try:
                     ts = int(parts[1].strip())
                 except ValueError:
                     ts = now
             else:
-                asin = line
-                ts = now  # Treat existing plain ASINs as posted today so they don't repeat for 2 days
+                asin = line.strip().upper()
+                ts = now
 
+            # Keep ASIN locked in memory if it was posted within the last 90 days
             if now - ts < COOLDOWN_SECONDS:
                 recent_asins[asin] = ts
 
@@ -63,14 +81,14 @@ def extract_asin(text):
     urls = re.findall(r'(https?://\S+)', text)
     for url in urls:
         clean_url = url.rstrip(').,!*\'"]')
-        direct_match = re.search(r'/(?:dp|gp/product|gp/aw/d)/([A-Z0-9]{10})', clean_url)
+        direct_match = re.search(r'/(?:dp|gp/product|gp/aw/d)/([A-Z0-9]{10})', clean_url, re.IGNORECASE)
         if direct_match:
-            return direct_match.group(1)
+            return direct_match.group(1).upper()
         try:
-            res = requests.get(clean_url, allow_redirects=True, timeout=8, headers=HEADERS)
-            redirect_match = re.search(r'/(?:dp|gp/product|gp/aw/d)/([A-Z0-9]{10})', res.url)
+            res = HTTP_SESSION.get(clean_url, allow_redirects=True, timeout=5)
+            redirect_match = re.search(r'/(?:dp|gp/product|gp/aw/d)/([A-Z0-9]{10})', res.url, re.IGNORECASE)
             if redirect_match:
-                return redirect_match.group(1)
+                return redirect_match.group(1).upper()
         except Exception:
             continue
     return None
@@ -80,13 +98,13 @@ def get_deal_details(asin, fallback_text):
     title, mrp, deal_price, discount_pct, img_url = None, None, None, None, None
 
     try:
-        res = requests.get(url, headers=HEADERS, timeout=8)
+        res = HTTP_SESSION.get(url, timeout=6)
         if res.status_code == 200:
             soup = BeautifulSoup(res.text, 'html.parser')
-            
+
             title_el = soup.find(id="productTitle")
             if title_el:
-                title = title_el.get_text().strip()[:100]
+                title = title_el.get_text().strip()[:110]
 
             price_el = soup.find("span", class_="a-price-whole")
             if price_el:
@@ -110,7 +128,7 @@ def get_deal_details(asin, fallback_text):
 
     if not title and fallback_text:
         lines = [line.strip() for line in fallback_text.split('\n') if line.strip() and not line.strip().startswith('http')]
-        title = lines[0][:100] if lines else "Amazon Hot Loot Deal"
+        title = lines[0][:110] if lines else "Amazon Hot Loot Deal"
     elif not title:
         title = "Amazon Hot Loot Deal"
 
@@ -129,17 +147,32 @@ def get_deal_details(asin, fallback_text):
 
     return title, mrp, deal_price, discount_pct, img_url
 
+def send_telegram_request(method, data=None, json_payload=None, files=None):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    for attempt in range(2):
+        res = requests.post(url, data=data, json=json_payload, files=files, timeout=15)
+        if res.status_code == 429:
+            retry_after = res.json().get("parameters", {}).get("retry_after", 10)
+            print(f"Telegram rate limit hit. Waiting {retry_after + 1}s...")
+            time.sleep(retry_after + 1)
+            continue
+        return res
+    return res
+
 def main():
+    start_time = time.time()
     recent_asins = load_recent_asins()
+    print(f"Loaded {len(recent_asins)} unique ASINs locked in 90-day (3-month) cooldown.")
     posted_count = 0
 
     with TelegramClient(StringSession(TG_SESSION), API_ID, API_HASH) as client:
         for channel in SOURCE_CHANNELS:
-            if posted_count >= MAX_POSTS_PER_RUN:
+            if posted_count >= MAX_POSTS_PER_RUN or (time.time() - start_time) > MAX_RUNTIME_SECONDS:
                 break
+            print(f"Scanning channel: {channel}...")
             try:
-                for message in client.iter_messages(channel, limit=60):
-                    if posted_count >= MAX_POSTS_PER_RUN:
+                for message in client.iter_messages(channel, limit=250):
+                    if posted_count >= MAX_POSTS_PER_RUN or (time.time() - start_time) > MAX_RUNTIME_SECONDS:
                         break
 
                     msg_text = message.text or message.message or ""
@@ -149,44 +182,48 @@ def main():
                         title, mrp, deal_price, discount_pct, img_url = get_deal_details(asin, msg_text)
                         affiliate_link = f"https://{AMAZON_DOMAIN}/dp/{asin}/?tag={MY_AFFILIATE_TAG}"
 
-                        lines = [f"🔥 *{title}* 🔥\n"]
+                        safe_title = html.escape(title)
+                        lines = [f"🔥 <b>{safe_title}</b> 🔥\n"]
                         if mrp:
-                            lines.append(f"❌ *MRP:* ~₹{mrp}~")
+                            lines.append(f"❌ <b>MRP:</b> <s>₹{mrp}</s>")
                         if deal_price:
-                            lines.append(f"✅ *Deal Price:* ₹{deal_price}")
+                            lines.append(f"✅ <b>Deal Price:</b> ₹{deal_price}")
                         if discount_pct:
-                            lines.append(f"📉 *Discount:* {discount_pct}% OFF")
-                        lines.append(f"\n🛒 *Buy Now:* {affiliate_link}")
+                            lines.append(f"📉 <b>Discount:</b> {discount_pct}% OFF")
+                        lines.append(f"\n🛒 <b>Buy Now:</b> {affiliate_link}")
 
                         caption = "\n".join(lines)
                         sent_successfully = False
 
+                        # 1. Try sending with source Telegram photo
                         if message.photo:
                             photo_path = client.download_media(message.media, file=f"temp_{asin}.jpg")
                             if photo_path and os.path.exists(photo_path):
                                 with open(photo_path, "rb") as photo_file:
-                                    res = requests.post(
-                                        f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                                        data={"chat_id": MY_TG_CHANNEL, "caption": caption, "parse_mode": "Markdown"},
+                                    res = send_telegram_request(
+                                        "sendPhoto",
+                                        data={"chat_id": MY_TG_CHANNEL, "caption": caption, "parse_mode": "HTML"},
                                         files={"photo": photo_file}
                                     )
                                     sent_successfully = res.ok
                                 os.remove(photo_path)
 
+                        # 2. Try sending with Amazon image URL
                         if not sent_successfully and img_url:
-                            res = requests.post(
-                                f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                                data={"chat_id": MY_TG_CHANNEL, "photo": img_url, "caption": caption, "parse_mode": "Markdown"}
+                            res = send_telegram_request(
+                                "sendPhoto",
+                                data={"chat_id": MY_TG_CHANNEL, "photo": img_url, "caption": caption, "parse_mode": "HTML"}
                             )
                             sent_successfully = res.ok
 
+                        # 3. Fallback to text message with link preview card
                         if not sent_successfully:
-                            res = requests.post(
-                                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                                json={
+                            res = send_telegram_request(
+                                "sendMessage",
+                                json_payload={
                                     "chat_id": MY_TG_CHANNEL,
                                     "text": caption,
-                                    "parse_mode": "Markdown",
+                                    "parse_mode": "HTML",
                                     "disable_web_page_preview": False
                                 }
                             )
@@ -196,16 +233,16 @@ def main():
                             recent_asins[asin] = int(time.time())
                             save_recent_asins(recent_asins)
                             posted_count += 1
-                            print(f"[{posted_count}/{MAX_POSTS_PER_RUN}] Posted unique ASIN: {asin}")
-                            time.sleep(3)
+                            print(f"[{posted_count}/{MAX_POSTS_PER_RUN}] Posted unique ASIN (90d lock): {asin}")
+                            time.sleep(3.5)
                         else:
-                            print(f"Failed to post {asin}: {res.text}")
+                            print(f"Telegram API error for {asin}: {res.text}")
 
             except Exception as e:
-                print(f"Error reading channel {channel}: {e}")
+                print(f"Skipped channel {channel}: {e}")
 
-    # Always save the cleaned list at the end of the run
     save_recent_asins(recent_asins)
+    print(f"Run finished. Total unique deals posted this cycle: {posted_count}")
 
 if __name__ == "__main__":
     main()
