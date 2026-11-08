@@ -18,21 +18,44 @@ AMAZON_DOMAIN = "www.amazon.in"
 SOURCE_CHANNELS = ["lootdeals_official", "indiadesire_deals", "desidime"]
 HISTORY_FILE = "posted_asins.txt"
 MAX_POSTS_PER_RUN = 20
+COOLDOWN_SECONDS = 48 * 3600  # 2 days (48 hours) strict cooldown
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept-Language": "en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7"
 }
 
-def load_posted_asins():
+def load_recent_asins():
+    now = int(time.time())
+    recent_asins = {}
     if not os.path.exists(HISTORY_FILE):
-        return set()
-    with open(HISTORY_FILE, "r") as f:
-        return set(line.strip() for line in f if line.strip())
+        return recent_asins
 
-def save_posted_asin(asin):
-    with open(HISTORY_FILE, "a") as f:
-        f.write(f"{asin}\n")
+    with open(HISTORY_FILE, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line == "INIT":
+                continue
+            if "|" in line:
+                parts = line.split("|", 1)
+                asin = parts[0].strip()
+                try:
+                    ts = int(parts[1].strip())
+                except ValueError:
+                    ts = now
+            else:
+                asin = line
+                ts = now  # Treat existing plain ASINs as posted today so they don't repeat for 2 days
+
+            if now - ts < COOLDOWN_SECONDS:
+                recent_asins[asin] = ts
+
+    return recent_asins
+
+def save_recent_asins(recent_asins):
+    with open(HISTORY_FILE, "w") as f:
+        for asin, ts in recent_asins.items():
+            f.write(f"{asin}|{ts}\n")
 
 def extract_asin(text):
     if not text:
@@ -85,7 +108,6 @@ def get_deal_details(asin, fallback_text):
     except Exception as e:
         print(f"Amazon scrape notice for {asin}: {e}")
 
-    # Fallback to Telegram message text if Amazon blocks pricing or title
     if not title and fallback_text:
         lines = [line.strip() for line in fallback_text.split('\n') if line.strip() and not line.strip().startswith('http')]
         title = lines[0][:100] if lines else "Amazon Hot Loot Deal"
@@ -108,7 +130,7 @@ def get_deal_details(asin, fallback_text):
     return title, mrp, deal_price, discount_pct, img_url
 
 def main():
-    posted_asins = load_posted_asins()
+    recent_asins = load_recent_asins()
     posted_count = 0
 
     with TelegramClient(StringSession(TG_SESSION), API_ID, API_HASH) as client:
@@ -116,14 +138,14 @@ def main():
             if posted_count >= MAX_POSTS_PER_RUN:
                 break
             try:
-                for message in client.iter_messages(channel, limit=50):
+                for message in client.iter_messages(channel, limit=60):
                     if posted_count >= MAX_POSTS_PER_RUN:
                         break
 
                     msg_text = message.text or message.message or ""
                     asin = extract_asin(msg_text)
 
-                    if asin and asin not in posted_asins:
+                    if asin and asin not in recent_asins:
                         title, mrp, deal_price, discount_pct, img_url = get_deal_details(asin, msg_text)
                         affiliate_link = f"https://{AMAZON_DOMAIN}/dp/{asin}/?tag={MY_AFFILIATE_TAG}"
 
@@ -139,7 +161,6 @@ def main():
                         caption = "\n".join(lines)
                         sent_successfully = False
 
-                        # 1. Try sending with source Telegram photo
                         if message.photo:
                             photo_path = client.download_media(message.media, file=f"temp_{asin}.jpg")
                             if photo_path and os.path.exists(photo_path):
@@ -152,7 +173,6 @@ def main():
                                     sent_successfully = res.ok
                                 os.remove(photo_path)
 
-                        # 2. Try sending with Amazon scraped image URL
                         if not sent_successfully and img_url:
                             res = requests.post(
                                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
@@ -160,7 +180,6 @@ def main():
                             )
                             sent_successfully = res.ok
 
-                        # 3. Fallback to text message with automatic link preview card
                         if not sent_successfully:
                             res = requests.post(
                                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
@@ -174,16 +193,19 @@ def main():
                             sent_successfully = res.ok
 
                         if sent_successfully:
-                            save_posted_asin(asin)
-                            posted_asins.add(asin)
+                            recent_asins[asin] = int(time.time())
+                            save_recent_asins(recent_asins)
                             posted_count += 1
-                            print(f"[{posted_count}/{MAX_POSTS_PER_RUN}] Posted ASIN: {asin}")
-                            time.sleep(3)  # Pause 3 seconds so Telegram doesn't rate-limit your bot
+                            print(f"[{posted_count}/{MAX_POSTS_PER_RUN}] Posted unique ASIN: {asin}")
+                            time.sleep(3)
                         else:
                             print(f"Failed to post {asin}: {res.text}")
 
             except Exception as e:
                 print(f"Error reading channel {channel}: {e}")
+
+    # Always save the cleaned list at the end of the run
+    save_recent_asins(recent_asins)
 
 if __name__ == "__main__":
     main()
