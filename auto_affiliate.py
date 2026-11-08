@@ -2,7 +2,7 @@ import os, re, time, html, hashlib, requests
 from bs4 import BeautifulSoup
 from telethon.sync import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.types import MessageEntityTextUrl, MessageEntityUrl
+from telethon.tl.types import MessageEntityTextUrl
 
 API_ID = int(os.environ['TG_API_ID'])
 API_HASH = os.environ['TG_API_HASH']
@@ -32,7 +32,7 @@ SOURCE_CHANNELS = [
 HISTORY_FILE = "posted_asins.txt"
 MAX_POSTS_PER_RUN = 100
 COOLDOWN_SECONDS = 90 * 24 * 3600  # 90 days (3 months) strict cooldown
-MAX_RUNTIME_SECONDS = 510          # 8.5 minutes cutoff so git push always finishes
+MAX_RUNTIME_SECONDS = 510          # 8.5 minutes safety cutoff
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -42,49 +42,35 @@ HEADERS = {
 HTTP_SESSION = requests.Session()
 HTTP_SESSION.headers.update(HEADERS)
 
-GENERIC_TITLES = {"amazon hot loot deal", "hot loot deal", "loot deal", "amazon deal"}
-
-def title_fingerprint(title):
-    if not title:
-        return None
-    clean = re.sub(r'[^a-z0-9 ]', '', title.lower()).strip()
-    if clean in GENERIC_TITLES:
-        return None
-    words = clean.split()
-    # Only fingerprint specific titles with at least 4 words so generic fallbacks never block posts
-    if len(words) < 4:
-        return None
-    core = " ".join(words[:7])
-    return "TTL_" + hashlib.md5(core.encode()).hexdigest()[:10].upper()
-
 def load_recent_keys():
     now = int(time.time())
     recent_keys = {}
     if not os.path.exists(HISTORY_FILE):
         return recent_keys
 
+    valid_lines = []
     with open(HISTORY_FILE, "r") as f:
         for line in f:
             line = line.strip()
             if not line or line == "INIT":
                 continue
-            if "|" in line:
-                parts = line.split("|", 1)
-                key = parts[0].strip().upper()
-                try:
-                    ts = int(parts[1].strip())
-                except ValueError:
-                    ts = now
-            else:
-                key = line.strip().upper()
+            
+            parts = line.split("|", 1)
+            key = parts[0].strip().upper()
+            try:
+                ts = int(parts[1].strip()) if len(parts) > 1 else now
+            except ValueError:
                 ts = now
 
-            # Ignore old generic TTL_ hashes that blocked previous runs
             if key.startswith("TTL_"):
                 continue
 
             if now - ts < COOLDOWN_SECONDS:
                 recent_keys[key] = ts
+                valid_lines.append(f"{key}|{ts}\n")
+
+    with open(HISTORY_FILE, "w") as f:
+        f.writelines(valid_lines)
 
     return recent_keys
 
@@ -99,13 +85,11 @@ def extract_all_urls(message):
     if text:
         urls.extend(re.findall(r'(https?://[^\s)\]>✨🔥🛒]+)', text))
 
-    # Also extract URLs hidden inside clickable "Buy Now" text links
     if message.entities:
         for ent in message.entities:
             if isinstance(ent, MessageEntityTextUrl) and ent.url:
                 urls.append(ent.url)
 
-    # Remove duplicates while preserving order
     seen = set()
     clean_urls = []
     for u in urls:
@@ -127,7 +111,6 @@ def extract_asins_from_message(message):
                 found_asins.append(asin)
             continue
 
-        # Expand short links (amzn.to, bit.ly, amzlinks.in, etc.)
         try:
             res = HTTP_SESSION.get(url, allow_redirects=True, timeout=4)
             redirect_match = re.search(r'/(?:dp|gp/product|gp/aw/d|exec/obidos/ASIN)/([A-Z0-9]{10})(?:[/?&#]|$)', res.url, re.IGNORECASE)
@@ -145,7 +128,6 @@ def get_deal_details(asin, fallback_text):
     title, mrp, deal_price, discount_pct, img_url = None, None, None, None, None
     canonical_asin = asin
 
-    # 1. Parse Telegram message text first (fast and immune to Amazon CAPTCHA)
     if fallback_text:
         clean_lines = []
         for line in fallback_text.split('\n'):
@@ -165,7 +147,6 @@ def get_deal_details(asin, fallback_text):
             if len(cleaned) > 1 and max(cleaned) > deal_price:
                 mrp = max(cleaned)
 
-    # 2. Try enriching from Amazon page (if Amazon doesn't CAPTCHA-block the IP)
     try:
         res = HTTP_SESSION.get(url, timeout=5)
         if res.status_code == 404:
@@ -183,14 +164,7 @@ def get_deal_details(asin, fallback_text):
             avail_el = soup.find(id="availability") or soup.find(id="outOfStock")
             if avail_el:
                 avail_text = avail_el.get_text().strip().lower()
-                unavailable_phrases = [
-                    "currently unavailable",
-                    "out of stock",
-                    "temporarily out of stock",
-                    "we don't know when or if this item will be back"
-                ]
-                if any(phrase in avail_text for phrase in unavailable_phrases):
-                    print(f"Skipping {asin}: Explicitly Out of Stock on Amazon.")
+                if any(phrase in avail_text for phrase in ["currently unavailable", "out of stock", "temporarily out of stock"]):
                     return False, canonical_asin, None, None, None, None, None
 
             title_el = soup.find(id="productTitle")
@@ -232,7 +206,6 @@ def send_telegram_request(method, data=None, json_payload=None, files=None):
         res = requests.post(url, data=data, json=json_payload, files=files, timeout=15)
         if res.status_code == 429:
             retry_after = res.json().get("parameters", {}).get("retry_after", 10)
-            print(f"Telegram rate limit hit. Waiting {retry_after + 1}s...")
             time.sleep(retry_after + 1)
             continue
         return res
@@ -269,18 +242,7 @@ def main():
                         is_available, canonical_asin, title, mrp, deal_price, discount_pct, img_url = get_deal_details(asin, msg_text)
                         now_ts = int(time.time())
 
-                        if canonical_asin in recent_keys:
-                            recent_keys[asin] = now_ts
-                            append_key_to_file(asin, now_ts)
-                            continue
-
-                        if not is_available:
-                            recent_keys[asin] = now_ts
-                            append_key_to_file(asin, now_ts)
-                            continue
-
-                        t_hash = title_fingerprint(title)
-                        if t_hash and t_hash in recent_keys:
+                        if canonical_asin in recent_keys or not is_available:
                             recent_keys[asin] = now_ts
                             append_key_to_file(asin, now_ts)
                             continue
@@ -295,14 +257,13 @@ def main():
                             lines.append(f"✅ <b>Deal Price:</b> ₹{deal_price}")
                         else:
                             lines.append(f"✅ <b>Deal Price:</b> Check Live Offer on Amazon")
-                        if discount_pct:
+                        if discount_pc := discount_pct:
                             lines.append(f"📉 <b>Discount:</b> {discount_pct}% OFF")
                         lines.append(f"\n🛒 <b>Buy Now:</b> {affiliate_link}")
 
                         caption = "\n".join(lines)
                         sent_successfully = False
 
-                        # 1. Send with source Telegram photo if only 1 product in message
                         if message.photo and len(asins) == 1:
                             photo_path = client.download_media(message.media, file=f"temp_{canonical_asin}.jpg")
                             if photo_path and os.path.exists(photo_path):
@@ -315,7 +276,6 @@ def main():
                                     sent_successfully = res.ok
                                 os.remove(photo_path)
 
-                        # 2. Send with Amazon scraped image URL
                         if not sent_successfully and img_url:
                             res = send_telegram_request(
                                 "sendPhoto",
@@ -323,7 +283,6 @@ def main():
                             )
                             sent_successfully = res.ok
 
-                        # 3. Fallback to rich link preview card (Telegram fetches Amazon thumbnail automatically)
                         if not sent_successfully:
                             res = send_telegram_request(
                                 "sendMessage",
@@ -337,7 +296,7 @@ def main():
                             sent_successfully = res.ok
 
                         if sent_successfully:
-                            for key in filter(None, {asin, canonical_asin, t_hash}):
+                            for key in {asin, canonical_asin}:
                                 recent_keys[key] = now_ts
                                 append_key_to_file(key, now_ts)
 
