@@ -2,6 +2,7 @@ import os, re, time, html, hashlib, requests
 from bs4 import BeautifulSoup
 from telethon.sync import TelegramClient
 from telethon.sessions import StringSession
+from telethon.tl.types import MessageEntityTextUrl, MessageEntityUrl
 
 API_ID = int(os.environ['TG_API_ID'])
 API_HASH = os.environ['TG_API_HASH']
@@ -31,7 +32,7 @@ SOURCE_CHANNELS = [
 HISTORY_FILE = "posted_asins.txt"
 MAX_POSTS_PER_RUN = 100
 COOLDOWN_SECONDS = 90 * 24 * 3600  # 90 days (3 months) strict cooldown
-MAX_RUNTIME_SECONDS = 480          # 8 minutes cutoff so git push always finishes
+MAX_RUNTIME_SECONDS = 510          # 8.5 minutes cutoff so git push always finishes
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -41,11 +42,17 @@ HEADERS = {
 HTTP_SESSION = requests.Session()
 HTTP_SESSION.headers.update(HEADERS)
 
+GENERIC_TITLES = {"amazon hot loot deal", "hot loot deal", "loot deal", "amazon deal"}
+
 def title_fingerprint(title):
     if not title:
         return None
-    words = re.sub(r'[^a-z0-9 ]', '', title.lower()).split()
-    if len(words) < 3:
+    clean = re.sub(r'[^a-z0-9 ]', '', title.lower()).strip()
+    if clean in GENERIC_TITLES:
+        return None
+    words = clean.split()
+    # Only fingerprint specific titles with at least 4 words so generic fallbacks never block posts
+    if len(words) < 4:
         return None
     core = " ".join(words[:7])
     return "TTL_" + hashlib.md5(core.encode()).hexdigest()[:10].upper()
@@ -72,6 +79,10 @@ def load_recent_keys():
                 key = line.strip().upper()
                 ts = now
 
+            # Ignore old generic TTL_ hashes that blocked previous runs
+            if key.startswith("TTL_"):
+                continue
+
             if now - ts < COOLDOWN_SECONDS:
                 recent_keys[key] = ts
 
@@ -82,38 +93,87 @@ def append_key_to_file(key, ts):
         f.write(f"{key}|{ts}\n")
         f.flush()
 
-def extract_asin(text):
-    if not text:
-        return None
-    urls = re.findall(r'(https?://\S+)', text)
+def extract_all_urls(message):
+    urls = []
+    text = message.text or message.message or ""
+    if text:
+        urls.extend(re.findall(r'(https?://[^\s)\]>✨🔥🛒]+)', text))
+
+    # Also extract URLs hidden inside clickable "Buy Now" text links
+    if message.entities:
+        for ent in message.entities:
+            if isinstance(ent, MessageEntityTextUrl) and ent.url:
+                urls.append(ent.url)
+
+    # Remove duplicates while preserving order
+    seen = set()
+    clean_urls = []
+    for u in urls:
+        u_clean = u.rstrip(').,!*\'"]')
+        if u_clean not in seen:
+            seen.add(u_clean)
+            clean_urls.append(u_clean)
+    return clean_urls
+
+def extract_asins_from_message(message):
+    urls = extract_all_urls(message)
+    found_asins = []
+
     for url in urls:
-        clean_url = url.rstrip(').,!*\'"]')
-        direct_match = re.search(r'/(?:dp|gp/product|gp/aw/d|exec/obidos/ASIN)/([A-Z0-9]{10})(?:[/?&#]|$)', clean_url, re.IGNORECASE)
+        direct_match = re.search(r'/(?:dp|gp/product|gp/aw/d|exec/obidos/ASIN)/([A-Z0-9]{10})(?:[/?&#]|$)', url, re.IGNORECASE)
         if direct_match:
-            return direct_match.group(1).upper()
+            asin = direct_match.group(1).upper()
+            if asin not in found_asins:
+                found_asins.append(asin)
+            continue
+
+        # Expand short links (amzn.to, bit.ly, amzlinks.in, etc.)
         try:
-            res = HTTP_SESSION.get(clean_url, allow_redirects=True, timeout=5)
+            res = HTTP_SESSION.get(url, allow_redirects=True, timeout=4)
             redirect_match = re.search(r'/(?:dp|gp/product|gp/aw/d|exec/obidos/ASIN)/([A-Z0-9]{10})(?:[/?&#]|$)', res.url, re.IGNORECASE)
             if redirect_match:
-                return redirect_match.group(1).upper()
+                asin = redirect_match.group(1).upper()
+                if asin not in found_asins:
+                    found_asins.append(asin)
         except Exception:
             continue
-    return None
+
+    return found_asins
 
 def get_deal_details(asin, fallback_text):
     url = f"https://{AMAZON_DOMAIN}/dp/{asin}"
     title, mrp, deal_price, discount_pct, img_url = None, None, None, None, None
     canonical_asin = asin
 
+    # 1. Parse Telegram message text first (fast and immune to Amazon CAPTCHA)
+    if fallback_text:
+        clean_lines = []
+        for line in fallback_text.split('\n'):
+            s = re.sub(r'https?://\S+', '', line).strip()
+            s = re.sub(r'[*_~`]', '', s).strip()
+            if len(s) > 8 and not re.match(r'^(buy now|grab now|loot deal|link|price|mrp|deal)', s.lower()):
+                clean_lines.append(s)
+        if clean_lines:
+            title = clean_lines[0][:110]
+
+        prices = re.findall(r'(?:₹|Rs\.?|INR|@|Price[:\s]*|MRP[:\s]*)\s*([0-9,]+)', fallback_text, re.IGNORECASE)
+        if not prices:
+            prices = re.findall(r'\b([0-9]{3,6})\b', fallback_text)
+        cleaned = [int(p.replace(',', '')) for p in prices if p.replace(',', '').isdigit() and 25 <= int(p.replace(',', '')) <= 250000]
+        if cleaned:
+            deal_price = min(cleaned)
+            if len(cleaned) > 1 and max(cleaned) > deal_price:
+                mrp = max(cleaned)
+
+    # 2. Try enriching from Amazon page (if Amazon doesn't CAPTCHA-block the IP)
     try:
-        res = HTTP_SESSION.get(url, timeout=6)
+        res = HTTP_SESSION.get(url, timeout=5)
         if res.status_code == 404:
             return False, canonical_asin, None, None, None, None, None
 
-        if res.status_code == 200:
+        if res.status_code == 200 and "api-services-support@amazon.com" not in res.text:
             soup = BeautifulSoup(res.text, 'html.parser')
 
-            # Detect canonical/parent ASIN if Amazon redirected or embedded it
             canon_link = soup.find("link", rel="canonical")
             if canon_link and canon_link.get("href"):
                 c_match = re.search(r'/dp/([A-Z0-9]{10})', canon_link["href"], re.IGNORECASE)
@@ -130,6 +190,7 @@ def get_deal_details(asin, fallback_text):
                     "we don't know when or if this item will be back"
                 ]
                 if any(phrase in avail_text for phrase in unavailable_phrases):
+                    print(f"Skipping {asin}: Explicitly Out of Stock on Amazon.")
                     return False, canonical_asin, None, None, None, None, None
 
             title_el = soup.find(id="productTitle")
@@ -141,10 +202,6 @@ def get_deal_details(asin, fallback_text):
                 p_str = re.sub(r'[^\d]', '', price_el.get_text())
                 if p_str:
                     deal_price = int(p_str)
-
-            buy_button = soup.find(id="add-to-cart-button") or soup.find(id="buy-now-button")
-            if title_el and not deal_price and not buy_button:
-                return False, canonical_asin, None, None, None, None, None
 
             mrp_el = soup.find("span", class_="a-text-price")
             if mrp_el:
@@ -161,24 +218,8 @@ def get_deal_details(asin, fallback_text):
     except Exception as e:
         print(f"Amazon scrape notice for {asin}: {e}")
 
-    if not title and fallback_text:
-        lines = [line.strip() for line in fallback_text.split('\n') if line.strip() and not line.strip().startswith('http')]
-        title = lines[0][:110] if lines else "Amazon Hot Loot Deal"
-    elif not title:
-        title = "Amazon Hot Loot Deal"
-
-    if not deal_price and fallback_text:
-        prices = re.findall(r'(?:₹|Rs\.?|INR|@)\s*([0-9,]+)', fallback_text, re.IGNORECASE)
-        if not prices:
-            prices = re.findall(r'\b([0-9]{2,6})\b', fallback_text)
-        cleaned = [int(p.replace(',', '')) for p in prices if p.replace(',', '').isdigit() and int(p.replace(',', '')) > 20]
-        if cleaned:
-            deal_price = min(cleaned)
-            if len(cleaned) > 1 and max(cleaned) > deal_price:
-                mrp = max(cleaned)
-
-    if not deal_price:
-        return False, canonical_asin, None, None, None, None, None
+    if not title:
+        title = f"Amazon Deal ({canonical_asin})"
 
     if mrp and deal_price and mrp > deal_price:
         discount_pct = round(((mrp - deal_price) / mrp) * 100)
@@ -187,7 +228,7 @@ def get_deal_details(asin, fallback_text):
 
 def send_telegram_request(method, data=None, json_payload=None, files=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    for attempt in range(2):
+    for attempt in range(3):
         res = requests.post(url, data=data, json=json_payload, files=files, timeout=15)
         if res.status_code == 429:
             retry_after = res.json().get("parameters", {}).get("retry_after", 10)
@@ -200,7 +241,7 @@ def send_telegram_request(method, data=None, json_payload=None, files=None):
 def main():
     start_time = time.time()
     recent_keys = load_recent_keys()
-    print(f"Loaded {len(recent_keys)} locked product keys (ASINs + Titles) in 90-day cooldown.")
+    print(f"Loaded {len(recent_keys)} locked ASINs in 90-day cooldown.")
     posted_count = 0
 
     with TelegramClient(StringSession(TG_SESSION), API_ID, API_HASH) as client:
@@ -209,88 +250,102 @@ def main():
                 break
             print(f"Scanning channel: {channel}...")
             try:
-                for message in client.iter_messages(channel, limit=150):
+                for message in client.iter_messages(channel, limit=250):
                     if posted_count >= MAX_POSTS_PER_RUN or (time.time() - start_time) > MAX_RUNTIME_SECONDS:
                         break
 
                     msg_text = message.text or message.message or ""
-                    asin = extract_asin(msg_text)
-
-                    if not asin or asin in recent_keys:
+                    asins = extract_asins_from_message(message)
+                    if not asins:
                         continue
 
-                    is_available, canonical_asin, title, mrp, deal_price, discount_pct, img_url = get_deal_details(asin, msg_text)
-                    now_ts = int(time.time())
+                    for asin in asins:
+                        if posted_count >= MAX_POSTS_PER_RUN or (time.time() - start_time) > MAX_RUNTIME_SECONDS:
+                            break
 
-                    # Check if canonical ASIN or normalized product title was already posted
-                    t_hash = title_fingerprint(title)
-                    if canonical_asin in recent_keys or (t_hash and t_hash in recent_keys):
-                        recent_keys[asin] = now_ts
-                        append_key_to_file(asin, now_ts)
-                        continue
+                        if asin in recent_keys:
+                            continue
 
-                    if not is_available:
-                        recent_keys[asin] = now_ts
-                        append_key_to_file(asin, now_ts)
-                        continue
+                        is_available, canonical_asin, title, mrp, deal_price, discount_pct, img_url = get_deal_details(asin, msg_text)
+                        now_ts = int(time.time())
 
-                    affiliate_link = f"https://{AMAZON_DOMAIN}/dp/{canonical_asin}/?tag={MY_AFFILIATE_TAG}"
+                        if canonical_asin in recent_keys:
+                            recent_keys[asin] = now_ts
+                            append_key_to_file(asin, now_ts)
+                            continue
 
-                    safe_title = html.escape(title)
-                    lines = [f"🔥 <b>{safe_title}</b> 🔥\n"]
-                    if mrp:
-                        lines.append(f"❌ <b>MRP:</b> <s>₹{mrp}</s>")
-                    if deal_price:
-                        lines.append(f"✅ <b>Deal Price:</b> ₹{deal_price} (In Stock)")
-                    if discount_pct:
-                        lines.append(f"📉 <b>Discount:</b> {discount_pct}% OFF")
-                    lines.append(f"\n🛒 <b>Buy Now:</b> {affiliate_link}")
+                        if not is_available:
+                            recent_keys[asin] = now_ts
+                            append_key_to_file(asin, now_ts)
+                            continue
 
-                    caption = "\n".join(lines)
-                    sent_successfully = False
+                        t_hash = title_fingerprint(title)
+                        if t_hash and t_hash in recent_keys:
+                            recent_keys[asin] = now_ts
+                            append_key_to_file(asin, now_ts)
+                            continue
 
-                    if message.photo:
-                        photo_path = client.download_media(message.media, file=f"temp_{asin}.jpg")
-                        if photo_path and os.path.exists(photo_path):
-                            with open(photo_path, "rb") as photo_file:
-                                res = send_telegram_request(
-                                    "sendPhoto",
-                                    data={"chat_id": MY_TG_CHANNEL, "caption": caption, "parse_mode": "HTML"},
-                                    files={"photo": photo_file}
-                                )
-                                sent_successfully = res.ok
-                            os.remove(photo_path)
+                        affiliate_link = f"https://{AMAZON_DOMAIN}/dp/{canonical_asin}/?tag={MY_AFFILIATE_TAG}"
 
-                    if not sent_successfully and img_url:
-                        res = send_telegram_request(
-                            "sendPhoto",
-                            data={"chat_id": MY_TG_CHANNEL, "photo": img_url, "caption": caption, "parse_mode": "HTML"}
-                        )
-                        sent_successfully = res.ok
+                        safe_title = html.escape(title)
+                        lines = [f"🔥 <b>{safe_title}</b> 🔥\n"]
+                        if mrp:
+                            lines.append(f"❌ <b>MRP:</b> <s>₹{mrp}</s>")
+                        if deal_price:
+                            lines.append(f"✅ <b>Deal Price:</b> ₹{deal_price}")
+                        else:
+                            lines.append(f"✅ <b>Deal Price:</b> Check Live Offer on Amazon")
+                        if discount_pct:
+                            lines.append(f"📉 <b>Discount:</b> {discount_pct}% OFF")
+                        lines.append(f"\n🛒 <b>Buy Now:</b> {affiliate_link}")
 
-                    if not sent_successfully:
-                        res = send_telegram_request(
-                            "sendMessage",
-                            json_payload={
-                                "chat_id": MY_TG_CHANNEL,
-                                "text": caption,
-                                "parse_mode": "HTML",
-                                "disable_web_page_preview": False
-                            }
-                        )
-                        sent_successfully = res.ok
+                        caption = "\n".join(lines)
+                        sent_successfully = False
 
-                    if sent_successfully:
-                        # Lock original ASIN, canonical ASIN, and Title Hash immediately
-                        for key in filter(None, {asin, canonical_asin, t_hash}):
-                            recent_keys[key] = now_ts
-                            append_key_to_file(key, now_ts)
+                        # 1. Send with source Telegram photo if only 1 product in message
+                        if message.photo and len(asins) == 1:
+                            photo_path = client.download_media(message.media, file=f"temp_{canonical_asin}.jpg")
+                            if photo_path and os.path.exists(photo_path):
+                                with open(photo_path, "rb") as photo_file:
+                                    res = send_telegram_request(
+                                        "sendPhoto",
+                                        data={"chat_id": MY_TG_CHANNEL, "caption": caption, "parse_mode": "HTML"},
+                                        files={"photo": photo_file}
+                                    )
+                                    sent_successfully = res.ok
+                                os.remove(photo_path)
 
-                        posted_count += 1
-                        print(f"[{posted_count}/{MAX_POSTS_PER_RUN}] Posted unique ASIN: {canonical_asin}")
-                        time.sleep(3.5)
-                    else:
-                        print(f"Telegram API error for {asin}: {res.text}")
+                        # 2. Send with Amazon scraped image URL
+                        if not sent_successfully and img_url:
+                            res = send_telegram_request(
+                                "sendPhoto",
+                                data={"chat_id": MY_TG_CHANNEL, "photo": img_url, "caption": caption, "parse_mode": "HTML"}
+                            )
+                            sent_successfully = res.ok
+
+                        # 3. Fallback to rich link preview card (Telegram fetches Amazon thumbnail automatically)
+                        if not sent_successfully:
+                            res = send_telegram_request(
+                                "sendMessage",
+                                json_payload={
+                                    "chat_id": MY_TG_CHANNEL,
+                                    "text": caption,
+                                    "parse_mode": "HTML",
+                                    "disable_web_page_preview": False
+                                }
+                            )
+                            sent_successfully = res.ok
+
+                        if sent_successfully:
+                            for key in filter(None, {asin, canonical_asin, t_hash}):
+                                recent_keys[key] = now_ts
+                                append_key_to_file(key, now_ts)
+
+                            posted_count += 1
+                            print(f"[{posted_count}/{MAX_POSTS_PER_RUN}] Posted unique ASIN: {canonical_asin}")
+                            time.sleep(3.2)
+                        else:
+                            print(f"Telegram API error for {canonical_asin}: {res.text}")
 
             except Exception as e:
                 print(f"Skipped channel {channel}: {e}")
