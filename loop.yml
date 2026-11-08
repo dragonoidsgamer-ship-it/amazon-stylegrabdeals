@@ -2,7 +2,7 @@ name: Autonomous Affiliate Loop
 
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '*/20 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -10,19 +10,15 @@ permissions:
 
 jobs:
   post-deals:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          persist-credentials: true
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - name: Install libraries
         run: pip install telethon requests cryptg
@@ -37,10 +33,10 @@ jobs:
           MY_TG_CHANNEL: ${{ secrets.MY_TG_CHANNEL }}
           MY_AFFILIATE_TAG: ${{ secrets.MY_AFFILIATE_TAG }}
 
-      - name: Commit and Push Posted ASINs
+      - name: Save Posted Products Memory
         run: |
           git config --global user.name "AffiliateAutoBot"
           git config --global user.email "bot@noreply.github.com"
           git add posted_asins.txt
-          git diff --staged --quiet || git commit -m "Auto-update posted ASINs memory [skip ci]"
+          git diff --staged --quiet || git commit -m "Update posted ASINs"
           git push
